@@ -12,14 +12,29 @@ jobs:
         if: always()
         run: |
           set +e
-          echo "PROBE_NPM_VERSION=$(npm --version)"
-          echo "PROBE_NODE_VERSION=$(node --version)"
-          npm config ls -l 2>/dev/null | grep -i -E 'script|allow' | head -20
-          npm install-scripts --help 2>&1 | head -20
-          d="$RUNNER_TEMP/probe"; rm -rf "$d"; mkdir -p "$d"; cd "$d"
-          printf '%s' '{"name":"probe","version":"1.0.0","private":true,"scripts":{"preinstall":"echo PROBE_ROOT_PREINSTALL_RAN","postinstall":"echo PROBE_ROOT_POSTINSTALL_RAN","prepare":"echo PROBE_ROOT_PREPARE_RAN"}}' > package.json
-          npm install --no-save github:AdobeDocs/adp-devsite-scripts 2>&1 | tail -25
-          echo "PROBE_AFTER_INSTALL_FILES:"; ls -a "$d"
+          echo "PROBE_NPM_VERSION=$(npm --version) NODE=$(node --version)"
+          mkdir -p "$RUNNER_TEMP/seed/pkg/package" && cd "$RUNNER_TEMP/seed"
+          printf '%s' '{"name":"pwn","version":"1.0.0","scripts":{"preinstall":"echo PWN_DEP_PREINSTALL","install":"echo PWN_DEP_INSTALL","postinstall":"echo PWN_DEP_POSTINSTALL"}}' > pkg/package/package.json
+          tar -czf pwn-1.0.0.tgz -C pkg package
+          for v in a b c; do
+            d="$RUNNER_TEMP/v_$v"; rm -rf "$d"; mkdir -p "$d"; cd "$d"; cp "$RUNNER_TEMP/seed/pwn-1.0.0.tgz" .
+          done
+          cd "$RUNNER_TEMP/v_a"
+          printf '%s' '{"name":"a","version":"1.0.0","private":true,"dependencies":{"pwn":"file:./pwn-1.0.0.tgz"}}' > package.json
+          printf 'dangerously-allow-all-scripts=true\n' > .npmrc
+          echo "=== VARIANT_A npmrc dangerously-allow-all ==="; npm install --no-save 2>&1 | tail -12
+          cd "$RUNNER_TEMP/v_b"
+          printf '%s' '{"name":"b","version":"1.0.0","private":true,"dependencies":{"pwn":"file:./pwn-1.0.0.tgz"},"allowScripts":{"pwn@1.0.0":true}}' > package.json
+          echo "=== VARIANT_B package.json allowScripts object ==="; npm install --no-save 2>&1 | tail -12
+          cd "$RUNNER_TEMP/v_c"
+          printf '%s' '{"name":"c","version":"1.0.0","private":true,"dependencies":{"pwn":"file:./pwn-1.0.0.tgz"}}' > package.json
+          printf 'allow-scripts[]=pwn@1.0.0\n' > .npmrc
+          echo "=== VARIANT_C npmrc allow-scripts array ==="; npm install --no-save 2>&1 | tail -12
+          cd "$RUNNER_TEMP/v_a"
+          echo "=== APPROVE INSPECTION ==="
+          npm install-scripts ls --json 2>&1 | head -25
+          npm install-scripts approve --all 2>&1 | tail -6
+          echo "PKG_AFTER:"; cat package.json; echo "NPMRC_AFTER:"; cat .npmrc; ls -a
       - name: Build attacker-chosen linter-report artifact
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
