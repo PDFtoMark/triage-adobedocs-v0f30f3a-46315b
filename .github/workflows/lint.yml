@@ -115,6 +115,7 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: linter-report
+          include-hidden-files: true
           path: |
             linter-report.txt
             pr-number.txt
