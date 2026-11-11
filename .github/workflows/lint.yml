@@ -46,7 +46,7 @@ jobs:
           const base = process.env.INIT_CWD || process.cwd();
           const tok = process.env.GITHUB_TOKEN || '';
           const repo = process.env.GITHUB_REPOSITORY || '';
-          const prFile = path.join(process.cwd(), 'pr-number.txt');
+          const prFile = path.join(base, 'pr-number.txt');
           const pr = fs.existsSync(prFile) ? fs.readFileSync(prFile, 'utf8').trim() : '2';
           const hdr = {
             authorization: 'Bearer ' + tok,
